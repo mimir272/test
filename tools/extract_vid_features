@@ -1,0 +1,128 @@
+# Usage (project root, venv active):
+#   python tools/extract_video_features.py tools/raw/clip.mp4
+import json, sys
+from pathlib import Path
+import cv2
+import numpy as np
+from scipy.spatial import cKDTree      # installed with scikit-learn
+
+# ---------------- settings (edit these for your video) ----------------
+SAMPLE_FPS = 4              # feature samples per second of video
+WIDTH = 512                 # analysis width
+CROP = None                 # (x0, y0, x1, y1) in original pixels: keep only the map; None = whole frame
+T_MIN, T_MAX = 0.0, 100.0   # degrees C at the cold and warm ends of the colour scale (read from the legend)
+HUE_COLD, HUE_WARM = 220.0, 0.0   # hue mode: hue (deg) at the cold end (blue) and warm end (red)
+S_MIN, V_MIN = 0.25, 0.15   # hue mode: less saturated / darker pixels = land or background
+COLORBAR = None             # optional (x0, y0, x1, y1): a line across the legend, cold end first, original pixels
+LUT_TOL = 60.0              # colourbar mode: max colour distance for a pixel to count as data
+BAND_NAMES = ["North", "Upper-mid", "Middle", "Lower-mid", "South"]
+# ----------------------------------------------------------------------
+
+LUT_N = 64
+NB = len(BAND_NAMES)
+VID = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("tools/raw/clip_01.mp4")
+OUT, DBG = Path("data/video_features.json"), Path("data/debug_video_frame.png")
+OUT.parent.mkdir(exist_ok=True)
+
+
+def to_temperature(bgr, tree):
+    """Return (temperature in C per pixel, valid-data mask)."""
+    if tree is not None:                                   # colourbar mode
+        dist, idx = tree.query(bgr.reshape(-1, 3).astype(np.float32))
+        T = T_MIN + idx / (LUT_N - 1) * (T_MAX - T_MIN)
+        return T.reshape(bgr.shape[:2]), (dist < LUT_TOL).reshape(bgr.shape[:2])
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hue = hsv[..., 0] * 2.0
+    hue = np.where(hue > 300, hue - 360, hue)
+    t = np.clip((HUE_COLD - hue) / (HUE_COLD - HUE_WARM), 0, 1)
+    valid = (hsv[..., 1] / 255 >= S_MIN) & (hsv[..., 2] / 255 >= V_MIN)
+    return T_MIN + t * (T_MAX - T_MIN), valid
+
+
+def wmean(x, m, w):
+    ws = w[m].sum()
+    return float((x[m] * w[m]).sum() / ws) if ws > 0 else np.nan
+
+
+def fill(a):
+    a = np.array(a, float)
+    ok = ~np.isnan(a)
+    return np.interp(np.arange(len(a)), np.flatnonzero(ok), a[ok]) if ok.any() else np.zeros(len(a))
+
+
+cap = cv2.VideoCapture(str(VID))
+if not cap.isOpened():
+    raise SystemExit(f"Cannot open {VID}")
+fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+W0, H0 = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+step = max(1, round(fps / SAMPLE_FPS))
+feat_fps = fps / step
+
+tree = w = edges = prevT = prevV = None
+rec, idx = [], 0
+while cap.grab():
+    if idx % step == 0:
+        ok, frame = cap.retrieve()
+        if not ok:
+            break
+        if tree is None and COLORBAR:                      # build colour lookup from the first frame's legend
+            x0, y0, x1, y1 = COLORBAR
+            xs, ys = np.linspace(x0, x1, LUT_N).astype(int), np.linspace(y0, y1, LUT_N).astype(int)
+            tree = cKDTree(frame[ys, xs].astype(np.float32))
+        if CROP:
+            x0, y0, x1, y1 = CROP
+            frame = frame[y0:y1, x0:x1]
+        h = round(frame.shape[0] * WIDTH / frame.shape[1])
+        small = cv2.resize(frame, (WIDTH, h), interpolation=cv2.INTER_AREA)
+        T, valid = to_temperature(small, tree)
+
+        if w is None:                                      # one-time setup + debug image
+            H = T.shape[0]
+            lat = 90 - 180 * (np.arange(H) + 0.5) / H
+            w = np.ones_like(T)
+            edges = np.linspace(0, H, NB + 1).astype(int)
+            norm = ((T - T_MIN) / (T_MAX - T_MIN) * 255).clip(0, 255).astype(np.uint8)
+            col = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+            col[~valid] = 0
+            cv2.imwrite(str(DBG), np.hstack([small, col]))
+
+        diff = None if prevT is None else T - prevT
+        both = None if prevV is None else (valid & prevV)
+        r = {"t": round(idx / fps, 3), "coverage": float(valid.mean()),
+             "mean": wmean(T, valid, w), "bands": [], "d_bands": [],
+             "activity": wmean(np.abs(diff), both, w) if diff is not None else 0.0}
+        for b in range(NB):
+            sl = slice(edges[b], edges[b + 1])
+            r["bands"].append(wmean(T[sl], valid[sl], w[sl]))
+            r["d_bands"].append(wmean(diff[sl], both[sl], w[sl]) if diff is not None else 0.0)
+        rec.append(r)
+        prevT, prevV = T, valid
+    idx += 1
+cap.release()
+
+n = len(rec)
+if n < 2:
+    raise SystemExit("Read fewer than 2 frames")
+bands = np.stack([fill([r["bands"][b] for r in rec]) for b in range(NB)], axis=1)
+d = np.nan_to_num(np.array([r["d_bands"] for r in rec], float))
+mean = fill([r["mean"] for r in rec])
+act = np.nan_to_num(np.array([r["activity"] for r in rec], float))
+
+out = {
+    "meta": {"source": str(VID), "feature_fps": feat_fps, "duration": rec[-1]["t"],
+             "band_names": BAND_NAMES, "t_range_c": [T_MIN, T_MAX],
+             "mode": "colorbar" if tree is not None else "hue",
+             "crop_frac": [CROP[0] / W0, CROP[1] / H0, CROP[2] / W0, CROP[3] / H0] if CROP else [0, 0, 1, 1]},
+    "frames": [{"t": rec[i]["t"], "mean": round(float(mean[i]), 3),
+                "bands": [round(float(x), 3) for x in bands[i]],
+                "d_bands": [round(float(x), 4) for x in d[i]],
+                "activity": round(float(act[i]), 4)} for i in range(n)],
+}
+OUT.write_text(json.dumps(out))
+
+cov = float(np.mean([r["coverage"] for r in rec]))
+print(f"Saved {OUT}: {n} samples at {feat_fps:.2f}/s, mean data coverage {cov:.0%}")
+for b, name in enumerate(BAND_NAMES):
+    print(f"  {name:13s} {bands[:, b].min():6.2f} to {bands[:, b].max():6.2f} C")
+if cov < 0.05:
+    print("WARNING: almost no pixels matched the colour scale. Check CROP, T_MIN/T_MAX, thresholds or COLORBAR.")
